@@ -36,6 +36,7 @@ import org.apache.beam.sdk.values.PInput;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
 import com.google.protobuf.ByteString;
 
 import java.io.IOException;
@@ -46,7 +47,11 @@ import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 import javax.annotation.Nullable;
@@ -186,7 +191,7 @@ public class TextIO {
      * (e.g., {@code *.gz} is gzipped, {@code *.bz2} is bzipped, and all other extensions are
      * uncompressed).
      */
-    public static Bound<String> withCompressionType(TextIO.CompressionType compressionType) {
+    public static Bound<String> withCompressionType(CompressorOperator compressionType) {
       return new Bound<>(DEFAULT_TEXT_CODER).withCompressionType(compressionType);
     }
 
@@ -212,14 +217,14 @@ public class TextIO {
       private final boolean validate;
 
       /** Option to indicate the input source's compression type. Default is AUTO. */
-      private final TextIO.CompressionType compressionType;
+      private final CompressorOperator compressionType;
 
       Bound(Coder<T> coder) {
         this(null, null, coder, true, TextIO.CompressionType.AUTO);
       }
 
       private Bound(String name, String filepattern, Coder<T> coder, boolean validate,
-          TextIO.CompressionType compressionType) {
+          CompressorOperator compressionType) {
         super(name);
         this.coder = coder;
         this.filepattern = filepattern;
@@ -286,7 +291,7 @@ public class TextIO {
        *
        * <p>Does not modify this object.
        */
-      public Bound<T> withCompressionType(TextIO.CompressionType compressionType) {
+      public Bound<T> withCompressionType(CompressorOperator compressionType) {
         return new Bound<>(name, filepattern, coder, validate, compressionType);
       }
 
@@ -310,28 +315,7 @@ public class TextIO {
 
         // Create a source specific to the requested compression type.
         final Bounded<T> read;
-        switch(compressionType) {
-          case UNCOMPRESSED:
-            read = org.apache.beam.sdk.io.Read.from(
-                new TextSource<T>(filepattern, coder));
-            break;
-          case AUTO:
-            read = org.apache.beam.sdk.io.Read.from(
-                CompressedSource.from(new TextSource<T>(filepattern, coder)));
-            break;
-          case BZIP2:
-            read = org.apache.beam.sdk.io.Read.from(
-                CompressedSource.from(new TextSource<T>(filepattern, coder))
-                                .withDecompression(CompressedSource.CompressionMode.BZIP2));
-            break;
-          case GZIP:
-            read = org.apache.beam.sdk.io.Read.from(
-                CompressedSource.from(new TextSource<T>(filepattern, coder))
-                                .withDecompression(CompressedSource.CompressionMode.GZIP));
-            break;
-          default:
-            throw new IllegalArgumentException("Unknown compression mode: " + compressionType);
-        }
+        read = compressionType.op(filepattern, coder);
 
         PCollection<T> pcol = input.getPipeline().apply("Read", read);
         // Honor the default output coder that would have been used by this PTransform.
@@ -365,7 +349,7 @@ public class TextIO {
         return validate;
       }
 
-      public TextIO.CompressionType getCompressionType() {
+      public TextIO.CompressorOperator getCompressionType() {
         return compressionType;
       }
     }
@@ -706,37 +690,190 @@ public class TextIO {
   /**
    * Possible text file compression types.
    */
-  public static enum CompressionType {
+  public static enum CompressionType implements CompressorOperator {
     /**
      * Automatically determine the compression type based on filename extension.
      */
-    AUTO(""),
+    AUTO("") {
+      @Override
+      public <T> Bounded<T> op(String filename, Coder<T> coder) {
+        return RegistryImpl.INSTANCE.wrap(filename, coder);
+      }
+    },
     /**
      * Uncompressed (i.e., may be split).
      */
-    UNCOMPRESSED(""),
+    UNCOMPRESSED("") {
+      @Override
+      public <T> Bounded<T> op(String filename, Coder<T> coder) {
+        return org.apache.beam.sdk.io.Read.from(
+                new TextSource<T>(filename, coder));
+      }
+    },
     /**
      * GZipped.
      */
-    GZIP(".gz"),
+    GZIP(".gz") {
+      @Override
+      public <T> Bounded<T> op(String filename, Coder<T> coder) {
+        return org.apache.beam.sdk.io.Read.from(
+                CompressedSource.from(new TextSource<T>(filename, coder))
+                        .withDecompression(CompressedSource.CompressionMode.GZIP));
+      }
+    },
     /**
      * BZipped.
      */
-    BZIP2(".bz2");
+    BZIP2(".bz2") {
+      @Override
+      public <T> Bounded<T> op(String filename, Coder<T> coder) {
+        return org.apache.beam.sdk.io.Read.from(
+                CompressedSource.from(new TextSource<T>(filename, coder))
+                        .withDecompression(CompressedSource.CompressionMode.BZIP2));
+      }
+    };
 
     private String filenameSuffix;
 
+    /**
+     * Get the compression registry.
+     *
+     * @return compression registry.
+       */
+    public static Registry getRegistry() {
+      return RegistryImpl.INSTANCE;
+    }
+
     private CompressionType(String suffix) {
       this.filenameSuffix = suffix;
+
+      if (!this.filenameSuffix.isEmpty()) {
+        RegistryImpl.INSTANCE.register(this.filenameSuffix, this);
+      }
     }
 
     /**
      * Determine if a given filename matches a compression type based on its extension.
+     *
      * @param filename the filename to match
      * @return true iff the filename ends with the compression type's known extension.
      */
     public boolean matches(String filename) {
       return filename.toLowerCase().endsWith(filenameSuffix.toLowerCase());
+    }
+  }
+
+  /**
+   * Receives a filename and a coder and returns a bounded PTransform.
+   *
+   * The registered compressor may be registered with {@code Compressiontype.AUTO}
+   */
+  public interface CompressorOperator {
+    public <T> Bounded<T> op(String filename, Coder<T> coder);
+  }
+
+  /**
+   * Registry to store and inject compressors.
+   */
+  public interface Registry {
+    /**
+     * Tests a filename for a known compressor.
+     * <p>
+     * Examples:
+     * <ul>
+     * <li>myfile.gz will match GZIP and return true</li>
+     * <li>myfile.bz2 will match BZIP2 and return true</li>
+     * <li>myfile.xz will return false unless an xz codec was registered</li>
+     * </ul>
+     * </p>
+     * @param filename tests filename for known compressors
+     * @return true if a compressor is found based on the given filename
+       */
+    boolean matches(String filename);
+
+    /**
+     * Returns a list of all registered compressor's file suffix.
+     * @returns an immutable set of all known registered compressor suffixes
+       */
+    Set<String> listRegisteredCompressors();
+
+    /**
+     * Registers a compressor.
+     *
+     * When using AUTO, all filenames matching a registered compressor
+     * will automatically select that compressor to run.
+     *
+     * @param patternToRegister Register a new compressor.
+     * @param op An operator which can be applied against a source.
+       */
+    void register(String patternToRegister, CompressorOperator op);
+
+    /**
+     * Unregisteres a registered compressor.
+     *
+     * @param patternToUnregister File type of compressor to remove.
+       */
+    void unregister(String patternToUnregister);
+
+    /**
+     * Resets registry to its default state.
+     *
+     * Default state includes:
+     * <ul>
+     *     <li>BZIP2</li>
+     *     <li>GZIP</li>
+     *     <li>UNCOMPRESSED when no match is found</li>
+     * </ul>
+     */
+    void resetRegistry();
+  }
+
+  private enum RegistryImpl implements Registry {
+    INSTANCE;
+    private ConcurrentHashMap<String, CompressorOperator> compressors =
+            new ConcurrentHashMap<>(new HashMap<String, CompressorOperator>());
+
+    <T> Bounded<T> wrap(String filename, Coder<T> coder) {
+      for (Map.Entry<String, CompressorOperator> entry : compressors.entrySet()) {
+        if (filename.toLowerCase().endsWith(entry.getKey())) {
+          return entry.getValue().op(filename, coder);
+        }
+      }
+      return CompressionType.UNCOMPRESSED.op(filename, coder);
+    }
+
+    @Override
+    public boolean matches(String filename) {
+      for (Map.Entry<String, CompressorOperator> entry : compressors.entrySet()) {
+        if (filename.toLowerCase().endsWith(entry.getKey())) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+
+    @Override
+    public Set<String> listRegisteredCompressors() {
+      return ImmutableSet.copyOf(this.compressors.keySet());
+    }
+
+    @Override
+    public void register(String patternToRegister, CompressorOperator op) {
+      this.compressors.put(patternToRegister, op);
+    }
+
+    @Override
+    public void unregister(String patternToUnregister) {
+      this.compressors.remove(patternToUnregister);
+    }
+
+    @Override
+    public void resetRegistry() {
+      this.compressors.clear();
+      // re-add default compressors
+      this.compressors.put(".gz", CompressionType.GZIP);
+      this.compressors.put(".bz2", CompressionType.BZIP2);
     }
   }
 
